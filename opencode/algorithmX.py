@@ -37,7 +37,7 @@ from torchvision import transforms
 from torch.nn import Sequential, Conv2d, ReLU, MaxPool2d, Linear, Dropout, Flatten
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-
+from tqdm import tqdm
 device = torch.device("cuda")
 
 
@@ -135,6 +135,57 @@ def train_to_device(net, train_dataloader, test_dataloader, epochss, lr, device)
 
         evaluate_accuracy(net, test_dataloader)
 
+
+def train_and_evaluate_accuracy(net, train_loader, valid_loader, num_epochs, lr, device,weight_decay):
+    l = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=weight_decay)
+
+    best_acc = 0.0
+    # train process
+    for epoch in range(num_epochs):
+        train_acc = []
+        train_loss = []
+        net.train()
+        for batch in tqdm(train_loader):
+            image, label = batch
+            image = image.to(device)
+            label = label.to(device)
+            hat = net(image)
+            loss = l(hat, label)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            acc = (hat.argmax(dim=-1) == label).float().mean()
+            train_loss.append(loss.item())
+            train_acc.append(acc)
+        train_loss_epoch = sum(train_loss) / len(train_loss)
+        train_acc_epoch = sum(train_acc) / len(train_acc)
+        print(
+            f"[ Train | {epoch + 1:03d}/{num_epochs:03d} ] loss = {train_loss_epoch:.5f}, acc = {train_acc_epoch:.5f}")
+        # evaluate process
+        net.eval()
+        valid_acc = []
+        valid_loss = []
+        for batch in tqdm(valid_loader):
+            image, label = batch
+            image = image.to(device)
+            label = label.to(device)
+            with torch.no_grad():
+                hat = net(image)
+            loss = l(hat, label)
+            acc = (hat.argmax(dim=-1) == label).float().mean()
+            valid_loss.append(loss)
+            valid_acc.append(acc)
+        valid_loss_epoch = sum(valid_loss) / len(valid_loss)
+        valid_acc_epoch = sum(valid_acc) / len(valid_acc)
+
+        print(
+            f"[ Valid | {epoch + 1:03d}/{num_epochs:03d} ] loss = {valid_loss_epoch:.5f}, acc = {valid_acc_epoch:.5f}")
+
+        if valid_acc_epoch > best_acc:
+            best_acc = valid_acc_epoch
+
+            print('saving model as the best acc {:.3f}'.format(best_acc))
 
 def vgg_block(num_convs, in_channels, out_channels):  # define the vgg blocks
     blocks = []
@@ -240,3 +291,44 @@ def GoogleLetNet():
     return  nn.Sequential(b1, b2, b3, b4, b5, nn.Linear(1024, 10))
 
 
+
+class Residual(nn.Module):
+    def __init__(self,in_channels,num_channels,use_1x1=False,strides=1):
+        super().__init__()
+        self.conv1=nn.Conv2d(in_channels,num_channels,kernel_size=3,padding=1,stride=strides)
+        self.conv2=nn.Conv2d(num_channels,num_channels,kernel_size=3,padding=1)
+        if use_1x1:
+            self.conv3=nn.Conv2d(in_channels,num_channels,kernel_size=1,stride=strides)
+        else:
+            self.conv3=None
+        self.b1=nn.BatchNorm2d(num_channels)
+        self.b2=nn.BatchNorm2d(num_channels)
+    def forward(self,x):
+        Y=F.relu(self.b1(self.conv1(x)))
+        Y=self.b2(self.conv2(Y))
+        if self.conv3:
+            x = self.conv3(x)
+        Y += x
+        return F.relu(Y)
+
+#before the resblock
+b1 = nn.Sequential(nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3),
+                   nn.BatchNorm2d(64), nn.ReLU(),
+                   nn.MaxPool2d(kernel_size=3, stride=2, padding=1))
+
+def resnet_block(in_channels,num_channels,num_resdiual,is_first=False):
+    blk=[]
+    for i in range(num_resdiual):
+        if i==0 and  not is_first:
+            blk.append(Residual(in_channels,num_channels,use_1x1=True,strides=2))
+        else:
+            blk.append(Residual(num_channels,num_channels))
+    return  blk
+
+b2 = nn.Sequential(*resnet_block(64, 64, 2, is_first=True))
+b3 = nn.Sequential(*resnet_block(64, 128, 2))
+b4 = nn.Sequential(*resnet_block(128, 256, 2))
+b5 = nn.Sequential(*resnet_block(256, 512, 2))
+
+def ResNet():
+    return nn.Sequential(b1, b2, b3, b4, b5, nn.AdaptiveAvgPool2d((1,1)),  nn.Flatten(), nn.Linear(512, 10))
