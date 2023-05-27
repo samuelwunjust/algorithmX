@@ -1,0 +1,261 @@
+
+import torch
+import torch.nn as nn
+import pandas as pd
+import numpy as np
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from PIL import Image
+import os
+import matplotlib.pyplot as plt
+import torchvision.models as models
+# This is for the progress bar.
+from tqdm import tqdm
+import seaborn as sns
+
+labels_dataf = pd.read_csv('train.csv')
+labels_dataf.head(5)
+labels_dataf.describe()
+
+
+def barw(ax):
+    for p in ax.patches:
+        val = p.get_width()  # height of the bar
+        x = p.get_x() + p.get_width()  # x- position
+        y = p.get_y() + p.get_height() / 2  # y-position
+        ax.annotate(round(val, 2), (x, y))
+
+
+# finding top leaves
+
+plt.figure(figsize=(15, 30))
+ax0 = sns.countplot(y=labels_dataf['label'], order=labels_dataf['label'].value_counts().index)
+barw(ax0)
+plt.show()
+
+leaves_labels = sorted(list(set(labels_dataf['label'])))
+n = len(leaves_labels)
+
+leaves_labels[:10]
+# 把label转成对应的数字
+class_to_num = dict(zip(leaves_labels, range(n)))
+class_to_num
+# 再转换回来，方便最后预测的时候使用
+num_to_class = {v: k for k, v in class_to_num.items()}
+
+
+class LeavesDataset(Dataset):
+    def __init__(self, csv_path, file_path, mode='train', valid_ratio=0.2, resize_height=256, resize_width=256):
+
+        self.resize_height = resize_height
+        self.resize_width = resize_width
+
+        self.file_path = file_path
+        self.mode = mode
+
+        # 读取 csv 文件
+        # 利用pandas读取csv文件
+        self.data_info = pd.read_csv(csv_path, header=None)  # header=None是去掉表头部分
+        # 计算 length
+        self.data_len = len(self.data_info.index) - 1
+        self.train_len = int(self.data_len * (1 - valid_ratio))
+
+        if mode == 'train':
+            # 第一列包含图像文件的名称
+            self.train_image = np.asarray(
+                self.data_info.iloc[1:self.train_len, 0])  # self.data_info.iloc[1:,0]表示读取第一列，从第二行开始到train_len
+            # 第二列是图像的 label
+            self.train_label = np.asarray(self.data_info.iloc[1:self.train_len, 1])
+            self.image_arr = self.train_image
+            self.label_arr = self.train_label
+        elif mode == 'valid':
+            self.valid_image = np.asarray(self.data_info.iloc[self.train_len:, 0])
+            self.valid_label = np.asarray(self.data_info.iloc[self.train_len:, 1])
+            self.image_arr = self.valid_image
+            self.label_arr = self.valid_label
+        elif mode == 'test':
+            self.test_image = np.asarray(self.data_info.iloc[1:, 0])
+            self.image_arr = self.test_image
+
+        self.real_len = len(self.image_arr)
+
+        print('Finished reading the {} set of Leaves Dataset ({} samples found)'
+              .format(mode, self.real_len))
+
+    def __getitem__(self, index):
+        # 从 image_arr中得到索引对应的文件名
+        single_image_name = self.image_arr[index]
+
+        # 读取图像文件
+        img_as_img = Image.open(self.file_path + single_image_name)
+
+        if self.mode == 'train':
+            transform = transforms.Compose([  # 图像增广
+                transforms.Resize((224, 224)),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.ToTensor()
+            ])
+        else:
+            # valid和test不增广
+            transform = transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.ToTensor()
+            ])
+
+        img_as_img = transform(img_as_img)
+
+        if self.mode == 'test':
+            return img_as_img
+        else:
+            # 得到图像的 string label
+            label = self.label_arr[index]
+            # number label
+            number_label = class_to_num[label]
+
+            return img_as_img, number_label  # 返回每一个index对应的图片数据和对应的label
+
+    def __len__(self):
+        return self.real_len
+
+
+train_path = 'train.csv'
+test_path = 'test.csv'
+image_path = ''
+model_path = './pre_res_model.ckpt'
+train_dataset = LeavesDataset(train_path, image_path, mode='train')
+test_dataset = LeavesDataset(test_path, image_path, mode='test')
+valid_dataset = LeavesDataset(train_path, image_path, mode='valid')
+print(train_dataset)
+print(valid_dataset)
+print(test_dataset)
+
+train_loader = torch.utils.data.DataLoader(
+    dataset=train_dataset,
+    batch_size=8,
+    shuffle=False,
+    num_workers=5,
+)
+
+valid_loader = torch.utils.data.DataLoader(
+    dataset=valid_dataset,
+    batch_size=8,
+    shuffle=False,
+    num_workers=5
+)
+
+test_loader = torch.utils.data.DataLoader(
+    dataset=test_dataset,
+    batch_size=8,
+    shuffle=False,
+    num_workers=5,
+)
+
+device = 'cuda'
+
+
+# resnet34模型
+def res34(num_classes, feature_extract=False, use_pretrained=True):
+    model_ft = models.resnet34(pretrained=use_pretrained)
+
+    num_ftrs = model_ft.fc.in_features
+    model_ft.fc = nn.Sequential(nn.Linear(num_ftrs, num_classes))
+
+    return model_ft
+
+
+net = res34(176)
+net = net.to(device)
+learning_rate = 3e-4
+weight_decay = 1e-3
+num_epoch = 50
+model_path = './pre_res_model.ckpt'
+
+
+def train_and_evaluate_accuracy(net, train_loader, valid_loader, num_epochs, lr, device):
+    l = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=weight_decay)
+
+    best_acc = 0.0
+    # train process
+    for epoch in range(num_epochs):
+        train_acc = []
+        train_loss = []
+        net.train()
+        for batch in tqdm(train_loader):
+            image, label = batch
+            image = image.to(device)
+            label = label.to(device)
+            hat = net(image)
+            loss = l(hat, label)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            acc = (hat.argmax(dim=-1) == label).float().mean()
+            train_loss.append(loss.item())
+            train_acc.append(acc)
+        train_loss_epoch = sum(train_loss) / len(train_loss)
+        train_acc_epoch = sum(train_acc) / len(train_acc)
+        print(
+            f"[ Train | {epoch + 1:03d}/{num_epochs:03d} ] loss = {train_loss_epoch:.5f}, acc = {train_acc_epoch:.5f}")
+        # evaluate process
+        net.eval()
+        valid_acc = []
+        valid_loss = []
+        for batch in tqdm(valid_loader):
+            image, label = batch
+            image = image.to(device)
+            label = label.to(device)
+            with torch.no_grad():
+                hat = net(image)
+            loss = l(hat, label)
+            acc = (hat.argmax(dim=-1) == label).float().mean()
+            valid_loss.append(loss)
+            valid_acc.append(acc)
+        valid_loss_epoch = sum(valid_loss) / len(valid_loss)
+        valid_acc_epoch = sum(valid_acc) / len(valid_acc)
+
+        print(
+            f"[ Valid | {epoch + 1:03d}/{num_epochs:03d} ] loss = {valid_loss_epoch:.5f}, acc = {valid_acc_epoch:.5f}")
+
+        if valid_acc_epoch > best_acc:
+            best_acc = valid_acc_epoch
+            torch.save(net.state_dict(), model_path)
+            print('saving model as the best acc {:.3f}'.format(best_acc))
+
+
+train_and_evaluate_accuracy(net, train_loader, valid_loader, num_epoch, learning_rate, device)
+
+saveFileName = './submission.csv'
+
+
+# the predict part
+## predict
+
+def predict(test_loader, saveFileName):
+    model = res34(176)
+    model = model.to(device)
+    model.load_state_dict(torch.load(model_path))
+    model.eval()
+    predictions = []
+    for batch in tqdm(test_loader):
+        image = batch
+        with torch.no_grad():
+            hat = model(image.to(device))
+        predictions.extend(hat.argmax(dim=-1).cpu().numpy().tolist())
+
+    preds = []
+    for i in predictions:
+        preds.append(num_to_class[i])
+    test_data = pd.read_csv(test_path)
+    test_data['label'] = pd.Series(preds)
+    submission = pd.concat([test_data['image'], test_data['label']], axis=1)
+    submission.to_csv(saveFileName, index=False)
+    print("Done!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+
+
+predict(test_loader, saveFileName)
+
+
+
+
+
